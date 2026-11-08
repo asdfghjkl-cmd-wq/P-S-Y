@@ -305,6 +305,7 @@ class server:
                 pass
     def em(self):
         a = Player()
+        n = []
         while True:
             if self.stopevent.is_set():
                 a.release()
@@ -316,7 +317,13 @@ class server:
             mea = me.get('from')
             
             try:
-                    
+                self.notice(n,'progress',{
+                        'state': str(a.player.get_state()),
+                        'time': p.get_time(),
+                        'length': p.get_length(),
+    
+                        'isplaying':a.player.is_playing()
+                    }))  
                     
                 if mel == b'play':a.play()
                 elif mel ==  b'pause':a.pause()
@@ -344,10 +351,12 @@ class server:
                         'message':a.music_message,
                         'isplaying':a.player.is_playing()
                     })
+                elif mel == b'subscribe_progress':
+
             except Exception:
                 traceback.print_exc()
                 self.notice(mea,'error',{'message':traceback.format_exc()})
-            
+
     def start(self):
         self.runthread = threading.Thread(target=self.u_socket,daemon=True)
         self.runthread.start()
