@@ -7,6 +7,7 @@ import socket
 from time import sleep
 import os,json,threading,platform,logging
 import traceback
+import proto
 start_music_message = True
 
 try:
@@ -58,6 +59,31 @@ NOFILE="!@#$%^&*&*()(&%^%$^*)"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 MUSIC_DIR = os.path.join(BASE_DIR,'music')
 ALL = 'all'
+
+# ---------------- 协议 ----------------
+# 帧格式:JSON + b'\x04' 结尾
+#   c->s  {"command": "set_music", "bag": {"name": "雨爱"}}
+#   s->c  {"title": "version", "bag": {"name": "mserver", ...}}
+SERVER_NAME = 'mserver'
+VERSION = 0.5
+SUPPORTS = {'plugin': False, 'seek': True, 'cover': True, 'progress': True}
+# 命令 -> 参数名列表,get_command_list 直接把这张表发给客户端
+COMMANDS = {
+    'get_version': [],          # 客户端握手:服务器名/版本/能力
+    'get_command_list': [],     # 客户端握手:命令表
+    'play': [],
+    'pause': [],
+    'stop': [],
+    'set_music': ['name'],
+    'seek_forward': [],
+    'seek_back': [],
+    'set_time': ['time'],       # 毫秒,进度条直接拖到某个位置
+    'set_volume': ['level'],    # 0-100
+    'get_music_list': [],
+    'get_status': [],
+    'subscribe_progress': [],
+    'unsubscribe_progress': [],
+}
 if platform.system() == 'Windows':
     os.environ['path'] += ';'+BASE_DIR
     os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
@@ -114,6 +140,29 @@ class Player:
             self.player.set_time(t)
     def time_minus_ten(self) -> None:
         if self.player.get_state() in (vlc.State.Playing,vlc.State.Paused):self.player.set_time(max(self.player.get_time()-10000,0)) # type: ignore
+    def set_music_file(self,name,file):
+        self.player.set_mrl(file)
+        self.load_message(name,file)
+    def play(self):
+        self.player.play()
+    def pause(self):
+        self.player.pause()
+
+
+
+    def get_picture_base64(self):
+        photo = self.music_photo
+        if photo is None:
+            return None
+        try:
+            if isinstance(photo, (bytes, bytearray)):
+                return b64encode(photo).decode('ascii')
+            buf = io.BytesIO()
+            photo.save(buf, format='PNG')
+            return b64encode(buf.getvalue()).decode('ascii')
+        except Exception:
+            logging.exception('封面转 base64 失败')
+            return None
     def _set_cover(self,pic_data=None):
             """统一设置封面:pic_data 为 None 时回到 a.png 的惰性单例。
         
@@ -133,26 +182,6 @@ class Player:
             except Exception:
                 logging.exception('解码内嵌封面失败,回退到默认封面')
                 self.music_photo = _default_photo()
-    def get_picture_base64(self):
-        photo = self.music_photo
-        if photo is None:
-            return None
-        try:
-            if isinstance(photo, (bytes, bytearray)):
-                return b64encode(photo).decode('ascii')
-            buf = io.BytesIO()
-            photo.save(buf, format='PNG')
-            return b64encode(buf.getvalue()).decode('ascii')
-        except Exception:
-            logging.exception('封面转 base64 失败')
-            return None
-    def set_music_file(self,name,file):
-        self.player.set_mrl(file)
-        self.load_message(name,file)
-    def play(self):
-        self.player.play()
-    def pause(self):
-        self.player.pause()
     def load_message(self,name:str,path:"str | None"):
             """读标签/封面。**本方法保证不抛**:任何失败都退化成"没有信息+默认封面"。
     
@@ -242,11 +271,14 @@ class server:
         self.send_quene_list = {}
         self.dc = {}
         self.t = None
+        self.player = None
+        self.subs = set()
+        print('%s v%s -> 127.0.0.1:%d' % (SERVER_NAME, VERSION, self.rp))
         self.c = {'pid':os.getpid(),'port':self.rp}
         json.dump(self.c,open(os.path.join(BASE_DIR,'run.pid'),'w',encoding='utf-8'))
         
     def recv_socket(self, sock, conn, event, address):
-        buf = b''
+        fr = proto.Proto()          # 每条连接一个缓冲:分帧状态不能串
         try:
             with sock:
                 while not event.is_set():
@@ -259,13 +291,11 @@ class server:
                         return
                     if not chunk:
                         return
-                    buf += chunk
-                    while b'\x04' in buf:          # 一次取出所有完整指令
-                        line, buf = buf.split(b'\x04', 1)
-                        if line:
-                            conn.put({'data': line, 'from': address})
+                    for m in fr.feed(chunk):     # 一次可能凑齐好几条
+                        conn.put({'msg': m, 'from': address})
         finally:
             self.dc.pop(address, None)    
+            self.subs.discard(address)
     def send_socket(self,sock:socket.socket,conn:queue.Queue,event:threading.Event):
         
         with sock:
@@ -276,7 +306,7 @@ class server:
                 try:x= conn.get(timeout=5)
                 except queue.Empty:continue
                 try:
-                    sock.sendall(x)
+                    sock.sendall(x)         # push() 给的就是整帧
                 except OSError:
                     return
     def u_socket(self):
@@ -295,74 +325,154 @@ class server:
             self.dc[b] = {'rthread':y,"stop":n,'send':c,'sthread':z}
             z.start()
             y.start()
-    def notice(self, mea, title, bag):
-        data = json.dumps({'title': title, 'bag': bag}).encode('utf-8')
-        targets = list(self.dc) if mea == ALL else ([mea] if mea in self.dc else [])
+            print(b)
+    def push(self, targets, title, bag):
+        """向一组地址推一条消息;断开的连接直接跳过,不影响其他订阅者。"""
+        data = proto.Proto.push(title, bag)
         for addr in targets:
+            q = self.dc.get(addr, {}).get('send')
+            if q is None:
+                continue
             try:
-                self.dc[addr]['send'].put_nowait(data)
-            except (KeyError, queue.Full):
+                q.put_nowait(data)
+            except queue.Full:
                 pass
+
+    def notice(self, mea, title, bag):
+        self.push(list(self.dc) if mea == ALL else [mea], title, bag)
+    def parse_command(self, raw):
+        """兼容旧接口:一帧 -> (command, bag),详细规则见 proto.Proto.decode。"""
+        try:
+            m = proto.Proto().decode(raw)
+        except proto.ProtoError:
+            return '', {}
+        return m.name, m.bag
+
     def em(self):
         a = Player()
-        n = []
-        while True:
-            if self.stopevent.is_set():
-                a.release()
-                self.notice(ALL,'bye',{'reason':'stop event is set'})
-                sleep(1)
-                break
-            me =self.recv_quene.get()
-            mel = me.get('data')
-            mea = me.get('from')
-            
+        self.player = a
+        while not self.stopevent.is_set():
             try:
-                self.notice(n,'progress',{
-                        'state': str(a.player.get_state()),
-                        'time': p.get_time(),
-                        'length': p.get_length(),
-    
-                        'isplaying':a.player.is_playing()
-                    }))  
-                    
-                if mel == b'play':a.play()
-                elif mel ==  b'pause':a.pause()
-                elif bytes(mel).startswith(b'set_music '):
-                    n = mel.decode().removeprefix('set_music').strip()
-                    m = self.music_list.dict.get(n,{}).get('music',NOFILE)
-                    if m == NOFILE:self.notice(mea,'error',{'message':"not found music"})
+                me = self.recv_quene.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            mea = me.get('from')
+            try:
+                m = me.get('msg')
+                cmd, bag = (m.name, m.bag) if m is not None else ('', {})
+                if cmd == 'play':
+                    a.play()
+                    self.notice(ALL, 'statuschange', {
+                                                "is_playing":1
+                                            })
+                elif cmd == 'pause':
+                    a.pause()
+                    sleep(0.4)
+                    self.notice(ALL, 'statuschange', {
+                                                "is_playing":a.player.is_playing()
+                                            })
+                elif cmd == 'set_music':
+                    name = str(bag.get('name', '')).strip()
+                    m = self.music_list.dict.get(name, {}).get('music', NOFILE)
+                    if m == NOFILE:
+                        self.notice(mea, 'error', {'message': 'not found music: %s' % name})
                     else:
-                        a.set_music_file(n, m)
-                        photo = a.get_picture_base64()          # 先算好，失败也不影响播放
-                        self.notice(ALL, 'musicchange',
-                                    {'now': n, 'message': a.music_message, 'photo': photo})
+                        a.set_music_file(name, m)
+                        self.notice(ALL, 'musicchange', {
+                            'now': name,
+                            'message': a.music_message,
+                            'photo': a.get_picture_base64(),
+                        })
                         a.play()
-                elif mel == b'get_music_list':
-                    self.notice(mea,'pushlist',self.music_list.dict)
-                elif mel== b'stop':
-                    self.stopevent.set()
-                elif mel == b'get_status':
+                        self.notice(ALL, 'statuschange', {
+                                                                        "is_playing":1
+                                                                    })
+                elif cmd == 'seek_forward':
+                    a.time_add_ten()
+                elif cmd == 'seek_back':
+                    a.time_minus_ten()
+                elif cmd == 'set_time':
+                    try:
+                        ms = int(bag.get('time', 0))
+                    except (TypeError, ValueError):
+                        ms = 0
+                    a.player.set_time(max(0, ms))
+                elif cmd == 'set_volume':
+                    try:
+                        lv = int(bag.get('level', 100))
+                    except (TypeError, ValueError):
+                        lv = 100
+                    a.player.audio_set_volume(max(0, min(100, lv)))
+                    self.notice(ALL,'volumechange',{'volume':max(0, min(100, lv))})
+                elif cmd == 'get_music_list':
+                    self.notice(mea, 'pushlist', self.music_list.dict)
+                elif cmd == 'get_volume':
+                    f = a.player.audio_get_volume()
+                    self.notice(mea,'volumechange',{'volume':f})
+                elif cmd == 'get_status':
                     p = a.player
                     self.notice(mea, 'status', {
                         'state': str(p.get_state()),
                         'time': p.get_time(),
                         'length': p.get_length(),
-                        'photo': a.get_picture_base64(),   # mutagen 读到的标签（值里有 list，能序列化）
-                        'message':a.music_message,
-                        'isplaying':a.player.is_playing()
+                        'photo': a.get_picture_base64(),
+                        'message': a.music_message,
+                        'isplaying': p.is_playing(),
                     })
-                elif mel == b'subscribe_progress':
-
+                elif cmd == 'get_version':
+                    self.notice(mea, 'version', {
+                        'name': SERVER_NAME,
+                        'version': VERSION,
+                        'supports': SUPPORTS,
+                    })
+                elif cmd == 'get_command_list':
+                    self.notice(mea, 'command_list', COMMANDS)
+                elif cmd == 'subscribe_progress':
+                    self.subs.add(mea)
+                elif cmd == 'unsubscribe_progress':
+                    self.subs.discard(mea)
+                elif cmd == 'stop':
+                    self.stopevent.set()
+                elif cmd:
+                    self.notice(mea, 'error', {'message': 'unknown command: %s' % cmd})
             except Exception:
                 traceback.print_exc()
-                self.notice(mea,'error',{'message':traceback.format_exc()})
+                try:
+                    self.notice(mea, 'error', {'message': traceback.format_exc()})
+                except Exception:
+                    pass
+
+        self.player = None          # 先摘引用:进度线程就不会再碰已经 release 的播放器
+        a.release()
+        self.notice(ALL, 'bye', {'reason': 'stop event is set'})
+        sleep(1)
+
+    def progress_loop(self):
+        """每 0.5s 给订阅者推一次播放进度;没有订阅者时什么都不做。"""
+        while not self.stopevent.is_set():
+            sleep(0.5)
+            subs = [x for x in list(self.subs) if x in self.dc]
+            pl = self.player
+            if not subs or pl is None:
+                continue
+            try:
+                p = pl.player
+                data = {'state': str(p.get_state()), 'time': p.get_time(),
+                        'length': p.get_length(), 'isplaying': p.is_playing()}
+            except Exception:
+                # 播放器已 release(退出时)或 VLC 内部出错:进度可以丢,进程不能被带挂
+                logging.debug('取播放进度失败,进度线程退出', exc_info=True)
+                return
+            self.push(subs, 'progress', data)
 
     def start(self):
         self.runthread = threading.Thread(target=self.u_socket,daemon=True)
         self.runthread.start()
         self.t=threading.Thread(target=self.em,daemon=True)
         self.t.start()
+        self.progress_thread = threading.Thread(target=self.progress_loop, daemon=True)
     def mainloop(self):
+        self.progress_thread.start()
         self.stopevent.wait()
     def stop(self):self.stopevent.set()
 if __name__ == "__main__":

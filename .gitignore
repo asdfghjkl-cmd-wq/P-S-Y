@@ -15,3 +15,9 @@ music/ssss/info.json
 music/x/a.mp4
 music/x/info.json
 music/x/n.mp3
+__pycache__
+_scratch
+.vscode
+run.pid
+music.log
+config.json
