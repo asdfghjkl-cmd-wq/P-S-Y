@@ -5,9 +5,9 @@
   s->c  {"title": "version", "bag": {"name": "mserver", "version": 0.5, "supports": {...}}}
   c->s  {"command": "set_music", "bag": {"name": "雨爱"}}
 """
-import platform
+
 import socket
-import os, json, threading, shutil, psutil, sys,subprocess
+import os, json, threading, shutil, psutil, sys
 import proto
 
 D = proto.DELIM

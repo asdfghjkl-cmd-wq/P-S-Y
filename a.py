@@ -9,12 +9,13 @@ import os,json,threading,platform,logging
 import traceback
 import proto
 start_music_message = True
-
+import psutil
 try:
     from PIL import Image
     import mutagen
     import mutagen.flac
     import mutagen.id3
+
 except ModuleNotFoundError:
     traceback.print_exc()
     logging.warning('mutagen不存在,无法加载音乐信息')
@@ -476,6 +477,16 @@ class server:
         self.stopevent.wait()
     def stop(self):self.stopevent.set()
 if __name__ == "__main__":
+    pid_path = os.path.join(BASE_DIR, 'run.pid')
+
+    with open(pid_path, 'r', encoding='utf-8') as f:
+        info = json.load(f)
+    if psutil.pid_exists(info.get('pid', -1)):
+        a = input('kill now prograem[y/n]:')
+        if a == 'y':
+            os.kill(info.get('pid', -1),8)
+        else:
+            os._exit(255)
     s = server()
     s.start()
     try:
