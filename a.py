@@ -85,6 +85,8 @@ COMMANDS = {
     'get_status': [],
     'subscribe_progress': [],
     'unsubscribe_progress': [],
+    'get_volume':[],
+
 }
 if platform.system() == 'Windows':
     os.environ['path'] += ';'+BASE_DIR
@@ -421,7 +423,7 @@ class server:
                     x ={}
                     for a in plugin_supports:x[a] = True
                     self.notice(mea, 'version', {
-                        'supports': SUPPORTS+a,
+                        'supports': SUPPORTS|x,
                         'name': SERVER_NAME,
                         'version': VERSION,
                     })
@@ -431,6 +433,7 @@ class server:
                     self.subs.add(mea)
                 elif cmd == 'unsubscribe_progress':
                     self.subs.discard(mea)
+
                 elif cmd == 'stop':
                     self.stopevent.set()
                 elif cmd:
