@@ -5,7 +5,7 @@ import queue
 from random import randint
 import socket
 from time import sleep
-import os,json,threading,platform,logging
+import os,json,threading,platform,logging,sys
 import traceback
 import proto
 start_music_message = True
@@ -66,8 +66,9 @@ ALL = 'all'
 #   c->s  {"command": "set_music", "bag": {"name": "雨爱"}}
 #   s->c  {"title": "version", "bag": {"name": "mserver", ...}}
 SERVER_NAME = 'mserver'
-VERSION = 0.5
+VERSION = 0.6
 SUPPORTS = {'plugin': False, 'seek': True, 'cover': True, 'progress': True}
+plugin_supports = []
 # 命令 -> 参数名列表,get_command_list 直接把这张表发给客户端
 COMMANDS = {
     'get_version': [],          # 客户端握手:服务器名/版本/能力
@@ -249,19 +250,15 @@ class server:
     def __init__(self):
         self.music_list = music_load()
         self.music_list.load(MUSIC_DIR)
+        # 先试固定端口(客户端 run.pid 丢了也找得到),被占了再退回随机端口。
         self.rp = None
-        ny = 1
-        while True:
-            for _ in range(200):
-                n = randint(1024,65535)
-                if check_port('127.0.0.1',port=n) :
-                    self.rp = n
-                    break
-            if not self.rp:print(f'refind {ny}')
-            elif ny == 10:break
-            else:break
-            ny+=1
-        
+        for n in [proto.DEFAULT_PORT] + [randint(1024, 65535) for _ in range(200)]:
+            if check_port('127.0.0.1', port=n):
+                self.rp = n
+                break
+        if not self.rp:
+            raise RuntimeError('找不到可用端口')
+
         self.a = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
         self.a.bind(('127.0.0.1',self.rp))
         self.a.listen(10)
@@ -421,10 +418,12 @@ class server:
                         'isplaying': p.is_playing(),
                     })
                 elif cmd == 'get_version':
+                    x ={}
+                    for a in plugin_supports:x[a] = True
                     self.notice(mea, 'version', {
+                        'supports': SUPPORTS+a,
                         'name': SERVER_NAME,
                         'version': VERSION,
-                        'supports': SUPPORTS,
                     })
                 elif cmd == 'get_command_list':
                     self.notice(mea, 'command_list', COMMANDS)
@@ -476,17 +475,69 @@ class server:
         self.progress_thread.start()
         self.stopevent.wait()
     def stop(self):self.stopevent.set()
-if __name__ == "__main__":
-    pid_path = os.path.join(BASE_DIR, 'run.pid')
+def _read_pid_file():
+    """run.pid 只是缓存:丢了、写坏了都当"没有",到底在不在由端口探测说了算。"""
+    try:
+        with open(os.path.join(BASE_DIR, 'run.pid'), 'r', encoding='utf-8') as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return info if isinstance(info, dict) else {}
 
-    with open(pid_path, 'r', encoding='utf-8') as f:
-        info = json.load(f)
-    if psutil.pid_exists(info.get('pid', -1)):
-        a = input('kill now prograem[y/n]:')
-        if a == 'y':
-            os.kill(info.get('pid', -1),8)
-        else:
-            os._exit(255)
+
+def _candidate_ports():
+    """探测哪些端口:run.pid 记的优先(旧版本实例可能是随机端口),再兜底固定端口。"""
+    ports = []
+    try:
+        p = int(_read_pid_file().get('port'))
+        if 0 < p < 65536:
+            ports.append(p)
+    except (TypeError, ValueError):
+        pass
+    if proto.DEFAULT_PORT not in ports:
+        ports.append(proto.DEFAULT_PORT)
+    return ports
+
+
+def _running_instance():
+    """连上并且回了 get_version 的才算活着。活着返回 (port, bag),否则 (None, None)。"""
+    for port in _candidate_ports():
+        bag = proto.probe_version('127.0.0.1', port)
+        if bag is not None:
+            return port, bag
+    return None, None
+
+
+def _kill_instance(port):
+    """让占着端口的那个退出:先发 stop 等它自己收尾,超时再强杀 run.pid 里的 pid。
+
+    关键是要等到端口真正空出来再返回:旧实例还要 release VLC、删 run.pid,
+    这段时间里监听套接字还占着端口,提前 server() 会 bind 失败、退回随机端口。
+    """
+    if not proto.request_stop('127.0.0.1', port):
+        pid = _read_pid_file().get('pid')
+        print('优雅退出超时,强杀 pid %s' % pid)
+        try:
+            psutil.Process(int(pid)).terminate()
+        except (psutil.Error, TypeError, ValueError):
+            return False
+    for _ in range(40):
+        if check_port('127.0.0.1', port):
+            return True
+        sleep(0.25)
+    return False
+
+
+if __name__ == "__main__":
+    busy_port, busy_bag = _running_instance()
+    if busy_port is not None:
+        print('已有 mserver 在 127.0.0.1:%d 上运行(v%s)'
+              % (busy_port, busy_bag.get('version')))
+        if input('停掉它并接管吗[y/N]:').strip().lower() != 'y':
+            sys.exit(0)
+        if not _kill_instance(busy_port):
+            print('旧实例没停下来(%d),本次不启动' % busy_port)
+            sys.exit(1)
     s = server()
     s.start()
     try:

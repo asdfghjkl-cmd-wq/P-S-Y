@@ -7,7 +7,7 @@
 """
 
 import socket
-import os, json, threading, shutil, psutil, sys
+import os, json, threading, shutil, sys
 import proto
 
 D = proto.DELIM
@@ -501,27 +501,22 @@ if __name__ == '__main__':
     meta = {'commands': {}, 'version': {}}
     x = threading.Event()
     pid_path = os.path.join(BASE_DIR, 'run.pid')
-    if not os.path.isfile(pid_path):
-        for a in range(10):
-            if not os.path.isfile(pid_path):
-                c = y.error('run.pid 不存在,服务器没启动',['press any key to exit','press "r" key to retaste','press "s" key to start server',f'no.{a}'])
-                if c == 'r':continue
-                
-                else:        
-                    sys.exit(255)
-            else:break
-    with open(pid_path, 'r', encoding='utf-8') as f:
-        info = json.load(f)
-    if not psutil.pid_exists(info.get('pid', -1)):
-
-
-                    y.error('服务器进程不在(pid %s)' % info.get('pid'))
-                    
-                          
-                    sys.exit(255)
+    info = {}
+    try:
+        with open(pid_path, 'r', encoding='utf-8') as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    # run.pid 只是缓存:能连上并回 get_version 才算服务器在;文件丢了就探默认端口。
+    port = info.get('port') or proto.DEFAULT_PORT
+    if proto.probe_version('127.0.0.1', port) is None:
+        y.error('服务器没响应(get_version 无回包)', ['press any key to exit'])
+        sys.exit(255)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.connect(('127.0.0.1', info.get('port', 0)))
+            s.connect(('127.0.0.1', port))
         except OSError as exc:
             y.error(str(exc))
             sys.exit(255)

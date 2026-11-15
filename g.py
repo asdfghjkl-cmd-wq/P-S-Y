@@ -20,7 +20,6 @@ import threading
 import time
 import tkinter
 
-import psutil
 import ttkbootstrap
 from PIL import Image, ImageTk
 from ttkbootstrap.dialogs import Messagebox
@@ -267,13 +266,26 @@ class App:
             return None
 
     def _live_server(self):
+        """连上并且回了 get_version 才算服务在。
+
+        run.pid 只当端口缓存:里面记的端口先探,探不到再探默认端口,所以
+        run.pid 丢了也不至于把"正在跑的服务端"当成没启动、又拉起一个。
+        """
         info = self._read_pid()
-        if not isinstance(info, dict):
-            return None
-        try:
-            return info if psutil.pid_exists(int(info.get('pid', -1))) else None
-        except (TypeError, ValueError):
-            return None
+        ports = []
+        if isinstance(info, dict):
+            try:
+                ports.append(int(info.get('port')))
+            except (TypeError, ValueError):
+                pass
+        if proto.DEFAULT_PORT not in ports:
+            ports.append(proto.DEFAULT_PORT)
+        for port in ports:
+            bag = proto.probe_version('127.0.0.1', port)
+            if bag is not None:
+                pid = (info or {}).get('pid')
+                return {'pid': pid, 'port': port, 'version': bag.get('version')}
+        return None
 
     def _connect(self):
         info = self._live_server()

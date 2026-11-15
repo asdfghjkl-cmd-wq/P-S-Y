@@ -10,10 +10,14 @@ Proto.feed():它只吐完整的帧,残片留在缓冲里等下一次。
 import json
 import socket
 import threading
+import time
 
 DELIM = b'\x04'
 ENCODING = 'utf-8'
 MAX_FRAME = 4 << 20     # 残帧超过这个长度就判坏:对端一直不吐分隔符时别把内存吃满
+
+# a.py 优先用的端口。固定一个的好处是:run.pid 丢了,客户端还能靠它找到服务端。
+DEFAULT_PORT = 51234
 
 _UNSET = object()
 
@@ -249,3 +253,51 @@ class Conn(Proto):
 
     def __repr__(self):
         return 'Conn(%r, timeout=%r)' % (self.sock, self.timeout)
+
+
+# ---------------- 存活判断 ----------------
+def probe_version(host='127.0.0.1', port=DEFAULT_PORT, timeout=2.0):
+    """连上去发 get_version,收到 version 回包才算活着。活着返回回包的 bag,否则 None。
+
+    比"pid 还在不在"靠谱:pid 会被系统复用,进程活着不代表它是 mserver;
+    端口能连上、并且回了 mserver 的握手,才是真能干活的那个。
+    连接被拒 / 端口被别的程序占着 / 回包不是 version,一律按"不在"处理。
+    """
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+    except (OSError, ValueError, TypeError):
+        return None
+    conn = Conn(sock, timeout=timeout)
+    try:
+        conn.send_command('get_version')
+        msg = conn.recv()
+        return msg.bag if (msg is not None and msg.name == 'version') else None
+    except (ProtoError, OSError):
+        return None
+    finally:
+        conn.close()
+
+
+def request_stop(host='127.0.0.1', port=DEFAULT_PORT, timeout=2.0, wait=6.0):
+    """礼貌地让对端退出:发 stop,再等它不再响应 get_version。
+
+    返回 True 表示(现在)已经探测不到它了;连都连不上的情况也算 True ——
+    调用方要的是"这个端口上没东西了"。
+    """
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+    except (OSError, ValueError, TypeError):
+        return True
+    conn = Conn(sock, timeout=timeout)
+    try:
+        conn.send_command('stop')
+    except (ProtoError, OSError):
+        pass
+    finally:
+        conn.close()
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if probe_version(host, port, timeout=0.8) is None:
+            return True
+        time.sleep(0.25)
+    return False
