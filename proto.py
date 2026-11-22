@@ -11,6 +11,7 @@ import json
 import socket
 import threading
 import time
+import warnings
 
 DELIM = b'\x04'
 ENCODING = 'utf-8'
@@ -31,17 +32,19 @@ class Closed(ProtoError):
 
 
 class Msg:
-    """一帧解出来的东西:name 是命令名或推送标题,bag 是参数。
+    """一帧解出来的东西:name 是命令名或推送标题,bag 是参数,path是路径。
 
     legacy=True 表示对端发的是老的纯文本指令(方便 telnet 调试),
     这时 bag 里只有 name 一个键。
     """
 
-    __slots__ = ('name', 'bag', 'legacy')
+    __slots__ = ('name', 'bag', 'path','legacy')
 
-    def __init__(self, name, bag=None, legacy=False):
+    def __init__(self, name, bag=None,path='/main', legacy=False):
         self.name = '' if name is None else str(name)
         self.bag = bag if isinstance(bag, dict) else {}
+        # path 也必须是字符串:旧版/写错的帧会把 dict 塞进 path,别让它传染下去
+        self.path = path if isinstance(path, str) and path else '/main'
         self.legacy = bool(legacy)
 
     def get(self, key, default=None):
@@ -54,11 +57,12 @@ class Msg:
         return key in self.bag
 
     def __eq__(self, other):
-        return (isinstance(other, Msg) and self.name == other.name
+        return (isinstance(other, Msg) and self.name == other.name and self.path == other.path
                 and self.bag == other.bag and self.legacy == other.legacy)
 
     def __repr__(self):
-        return 'Msg(%r, %r%s)' % (self.name, self.bag, ', legacy' if self.legacy else '')
+        return 'Msg(%r, %r, path=%r%s)' % (self.name, self.bag, self.path,
+                                           ', legacy' if self.legacy else '')
 
 
 class Proto:
@@ -71,22 +75,22 @@ class Proto:
 
     # ---------------- 组帧 ----------------
     @staticmethod
-    def frame(name, bag=None, key='command'):
-        return json.dumps({key: str(name), 'bag': dict(bag or {})},
+    def frame(name, bag=None, path='/main', key='command'):
+        return json.dumps({key: str(name), 'bag': dict(bag or {}), 'path':path},
                           ensure_ascii=False).encode(ENCODING) + DELIM
 
     @classmethod
-    def command(cls, name, bag=None):
-        """c->s 方向。"""
-        return cls.frame(name, bag, 'command')
+    def command(cls, name, bag=None, path='/main'):
+        """c->s 方向。bag 在前、path 在后:所有老调用点都按 push(title, bag) 传参。"""
+        return cls.frame(name, bag, path, 'command')
 
     @classmethod
-    def push(cls, title, bag=None):
+    def push(cls, title, bag=None, path='/main'):
         """s->c 方向。"""
-        return cls.frame(title, bag, 'title')
+        return cls.frame(title, bag, path, 'title')
 
     @classmethod
-    def parse_line(cls, line, commands=None):
+    def parse_line(cls, line,commands=None):
         """一行 "set_music 雨爱" -> (command, bag);空行返回 None。
 
         commands 是服务端 get_command_list 给的表,没有就按单参数兜底。
@@ -133,7 +137,12 @@ class Proto:
         else:
             name = obj.get('command', obj.get('comand'))
         bag = obj.get('bag')
-        return Msg(name, bag if isinstance(bag, dict) else {})
+        if 'path' in obj:
+            path = obj.get('path')
+        else:
+            warnings.warn('old frame',UserWarning)
+            path = '/main'
+        return Msg(name, bag if isinstance(bag, dict) else {},path)
 
     def _legacy(self, text):
         cmd, _, arg = text.partition(' ')
